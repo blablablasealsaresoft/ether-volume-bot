@@ -47,7 +47,16 @@ export const ROBINHOOD_RPC_ENDPOINT = String(process.env['ROBINHOOD_RPC_ENDPOINT
 export const UNISWAP_V3_ROUTER_ROBINHOOD = '0xCaf681a66D020601342297493863E78C959E5cb2';
 export const WETH_ADDRESS_ROBINHOOD = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
 // Pool fee tier (hundredths of a bip) of the token's V3 pool on Robinhood Chain.
-export const ROBINHOOD_POOL_FEE = Number(process.env['ROBINHOOD_POOL_FEE'] || 3000);
+// 0 = auto-detect the pool's fee tier from the V3 factory (recommended; Pons V1
+// launches use 10000, ordinary pairs use 500/3000).
+export const ROBINHOOD_POOL_FEE = Number(process.env['ROBINHOOD_POOL_FEE'] || 0);
+// Slippage protection for Robinhood Chain V3 swaps, in basis points
+// (1000 = allow up to 10% price movement against the quoted output).
+export const ROBINHOOD_SLIPPAGE_BPS = Number(process.env['ROBINHOOD_SLIPPAGE_BPS'] || 1000);
+// Uniswap V3 periphery on Robinhood Chain (chain 4663), per the official Uniswap
+// deployment list; QuoterV2 is state-mutating but safe to read via eth_call.
+export const UNISWAP_V3_QUOTER_ROBINHOOD = '0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7';
+export const UNISWAP_V3_FACTORY_ROBINHOOD = '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA';
 
 export const CONFIRM_ENDPOINT = testVersion ? ETH_SEPOLIA_RPC_ENDPOINT : MEV_BLOCK_RPC_ENDPOINT;
 export const ETH_ENDPOINT = testVersion ? ETH_SEPOLIA_RPC_ENDPOINT : ETH_RPC_ENDPOINT;
