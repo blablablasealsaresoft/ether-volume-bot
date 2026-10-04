@@ -1,102 +1,88 @@
-# Volume bot on EVM chains
+# Volume bot — Robinhood Chain / Pons v2 edition
+
+Fork of [donpushme/ether-volume-bot](https://github.com/donpushme/ether-volume-bot),
+heavily extended for **Robinhood Chain** (chainId 4663) and **Pons v2 launchpad** tokens.
+
+## What this fork adds
+
+- **Robinhood Chain support** (Arbitrum Orbit L2, ETH gas)
+  - Uniswap **V3** trading via SwapRouter02 with automatic fee-tier detection
+    and QuoterV2-backed slippage protection (`ROBINHOOD_SLIPPAGE_BPS`)
+  - **Pons v2 launchpad** integration: set `TARGET_TOKEN_ADDRESS` and the bot
+    auto-detects how to trade it —
+    - **pre-graduation**: per-launch bonding curve (buy/sell with fee, creator
+      tax, and decaying snipe tax priced in; buys wait 5s so the snipe tax decays)
+    - **post-graduation**: the launch's Uniswap **v4** pool via Universal Router
+      (Permit2-pulled sells, native-value buys). Quotes are produced by
+      simulating the exact router calldata on-chain with a binary search on
+      `amountOutMinimum` — every send is preceded by a passing rehearsal of
+      byte-identical calldata
+  - Robust funding/sweeping tuned for Orbit chains: explicit EIP-1559 caps
+    derived from the live base fee (Orbit ignores priority tips) and a 100k gas
+    floor (21k transfers are rejected as "intrinsic gas too low")
+- `run-bot.ps1` continuous loop with a fuel guard (stops at a reserve instead of
+  grinding the base wallet empty)
+- Verification scripts: `verify-quoter.cjs`, `verify-pons.cjs`, `verify-v4.cjs`
 
 ## Supported chains
-BSC, Ethereum mainnet, (Any EVM chain)
 
-## Technology
+- **Robinhood Chain** (Pons v2 launchpad tokens, Uniswap v3/v4) ← primary
+- BSC, Ethereum mainnet (original bot paths)
 
-Languange: Typescript, Solidity
-Type: Bot Script
+## Setup
 
-## How to use the bot?
-
-- You should install node modules by
 ```
 npm i
 ```
 
-- Edit the contents in the `.env` file. I've already sent you the project with `.env` file.
+Fill in `.env` (copy `.env.example`):
 
-You should input your wallet address and privatekey there.
 ```
-ETH_BASE_WALLET_ADDRESS="Your wallet address"
-ETH_BASE_WALLET_ADDRESS="The private key of your base wallet"
-```
-There are rpc addresses in thge`.env` file and they are not paid version.
-
-If you have good one you can replce them with yours.
-
-- Then you should see the `config.json` file. I has the main configurations for running the bot. I added comments for your good understanding.
-```
-//Random amount for wallet.
-export const amountMax = 0.003; //Ether balance
-export const amountMin = 0.001; //Should be more than 0.001
-
-//Fee balance that must be remaining in the wallet
-export const fee = 0.001; //Must be greater than 0.001
+TARGET_TOKEN_ADDRESS=0x...      # the token to trade
+ETH_BASE_WALLET_ADDRESS=0x...   # funding wallet
+ETH_BASE_WALLET_PRIVATE_KEY=... # funding wallet key (never share/commit)
+ROBINHOOD_RPC_ENDPOINT=https://rpc.mainnet.chain.robinhood.com
 ```
 
-I recommend that you should increase `fee` for the successful transaction. ex: 0.05, 0.06.
+`config.ts` knobs:
 
-Before that you should have enough BNB in your base wallet.
+| knob | meaning |
+|---|---|
+| `CHAINID` | set `ChainId.Robinhood` for Robinhood Chain |
+| `amountMin/amountMax` | per-wallet trade size (ETH) |
+| `fee` | ETH kept in each sub-wallet for gas |
+| `subWalletNum` | sub-wallets per pass |
+| `minInterval/maxInterval` | random buy→sell delay window (ms) |
 
-For example if you set config values like this...
+Budget rule of thumb: fund the base wallet with roughly
+`(amountMax + fee) * subWalletNum * 1.5` — leftovers are swept back to the base
+wallet after every round.
+
+## Running
+
 ```
-//Random time interval of buy and sell
-export const maxInterval = 30000 //millisecond
-export const minInterval = 5000//millisecond
-
-//Random amount for wallet.
-export const amountMax = 0.03; //Ether balance
-export const amountMin = 0.01; //Should be more than 0.001
-
-//Fee balance that must be remaining in the wallet
-export const fee = 0.005; //Must be greater than 0.001
-
-//Number of sub wallets.
-export const subWalletNum = 20;
-
-//ChainId : Sepolia, BSC, Ethereum
-export const CHAINID:ChainId = ChainId.BSC;
+node verify-pons.cjs        # optional: check the launch record on-chain
+npm run dev                 # one pass over the sub-wallets
 ```
 
-Your wallet should have `(0.03 + 0.005) * 20 = 0.7 (BNB/ETH);
+Continuous volume:
 
-I Recommend that you should use much fee value like 0.01 so that you can gather funds if you have some error while running the bot.
-
-While you are running the bot there will be a new json file to save the wallets you generated, so you can withdraw funds if there is a problem.
-
-I will add automatic fund-gathering function later if you want.
-
-
-Then you can run the bot
 ```
-npm run dev
+powershell -ExecutionPolicy Bypass -File run-bot.ps1
 ```
 
+The loop re-runs passes until the base wallet hits the reserve, then stops.
 
-## Features
-- Generating random wallets
-- Funding wallets that will trade as real traders
-- Random trade with funded wallets
-- Gathering funds after work
+## Routing logic (Robinhood Chain)
 
-## Example
+1. Is `TARGET_TOKEN_ADDRESS` a Pons v2 launch? (factory lookup)
+   - on-curve → bonding-curve buy/sell
+   - graduated → Uniswap v4 pool via Universal Router
+2. Otherwise → Uniswap V3 (`exactInputSingle`, fee tier auto-detected, quote-backed slippage floor)
 
+## Notes
 
-https://github.com/user-attachments/assets/ac6e55f6-7ece-4cad-8dc7-883423c32f4e
-
-## Tx links
-https://bscscan.com/tx/0x581cda788080b52fbd5db8c4d3500c22a6c136a07b73e2311d1fc29330d48fe5
-https://bscscan.com/tx/0x8c870cf1721c2c765b45d2b13731bf384ec2e8020552aafb0436c01ded98f2ab
-https://bscscan.com/tx/0xb46d289c48d04dc6cc74849ecd9ef4fff6bf86aa3b16fc231d019b82c7789bc2
-
-## Future
-- Randomizing trading amount
-- Randomizing trading frequency (Buy/Sell)
-- Randomizing the pool
-
-## How to contact
-Telegram: [@midaBricoll](https://t.me/midaBricoll)
-
-Twitter: [@dieharye](https://x.com/dieharye)
+- ETH-paired Pons launches only.
+- The bot wallet is just another trader — launch your token from a separate
+  creator wallet; the bot never needs the creator key.
+- `.env` and `wallets/*.json` hold keys — gitignored, never commit them.
