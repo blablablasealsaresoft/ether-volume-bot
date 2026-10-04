@@ -8,7 +8,7 @@ import {
   TARGET_TOKEN_ADDRESS
 } from './constants'
 import { ChainId, Wallet } from './types';
-import { PONS_V2_FACTORY, ROBINHOOD_POOL_FEE, ROBINHOOD_SLIPPAGE_BPS, UNISWAP_V3_FACTORY_ROBINHOOD, UNISWAP_V3_QUOTER_ROBINHOOD, WrappedNative } from './constants';
+import { PONS_MEME_HOOK, PONS_V2_FACTORY, PERMIT2_ROBINHOOD, ROBINHOOD_POOL_FEE, ROBINHOOD_SLIPPAGE_BPS, UNISWAP_V3_FACTORY_ROBINHOOD, UNISWAP_V3_QUOTER_ROBINHOOD, UNIVERSAL_ROUTER_ROBINHOOD, WrappedNative } from './constants';
 import { delay, gather, generateWallets, getRandomDelay, getRouterAddress, getRpc, readingWallets, saveWallet, sendEther } from './utils';
 import { ethers } from 'ethers'
 import fs from "fs";
@@ -80,18 +80,29 @@ const PONS_CURVE_ABI = [
   'function currentSnipeTaxBps(address recipient) view returns (uint256)',
 ];
 
-// If the token is a live Pons v2 launch on its bonding curve, return the curve
-// address; otherwise null (the token trades on a DEX instead).
-export async function ponsCurveFor(provider: ethers.JsonRpcProvider, tokenAddress: string): Promise<string | null> {
+// Pons v2 launch record for a token: which venue it trades on right now.
+// - onCurve: pre-graduation bonding curve (buy via curve.buy, sell via curve.sell)
+// - graduated: finished curve; trades route through the locked Uniswap v4 pool
+// - otherwise null: not a Pons launch (falls through to Uniswap V3)
+export type PonsLaunch = {
+  token: string; curve: string; pairToken: string; poolFee: number; tickSpacing: number;
+  onCurve: boolean; graduated: boolean;
+};
+export async function ponsLaunchFor(provider: ethers.JsonRpcProvider, tokenAddress: string): Promise<PonsLaunch | null> {
   const factory = new ethers.Contract(PONS_V2_FACTORY, PONS_FACTORY_ABI, provider);
-  const launch: { curve: string; pairToken: string; phase: bigint; exists: boolean } = await factory.getLaunchedToken(tokenAddress);
+  const launch: { token: string; curve: string; pairToken: string; poolFee: bigint; tickSpacing: bigint; phase: bigint; exists: boolean } = await factory.getLaunchedToken(tokenAddress);
   if (!launch.exists) return null;
-  // phase 0 = NotGraduated. Once graduated, trades belong on the Uniswap v4 pool.
-  if (launch.phase !== 0n) return null;
-  if (launch.pairToken !== ethers.ZeroAddress) throw new Error(`Pons v2 launch ${tokenAddress} is paired against ${launch.pairToken}, not ETH; the bot only supports ETH-paired curves.`);
-  const curve = new ethers.Contract(launch.curve, PONS_CURVE_ABI, provider);
-  if (await curve.graduated()) return null;
-  return launch.curve;
+  if (launch.pairToken !== ethers.ZeroAddress) throw new Error(`Pons v2 launch ${tokenAddress} is paired against ${launch.pairToken}, not ETH; the bot only supports ETH-paired launches.`);
+  const onCurve = launch.phase === 0n;
+  if (onCurve) {
+    const curve = new ethers.Contract(launch.curve, PONS_CURVE_ABI, provider);
+    // Sells close before graduation actually runs; treat ready-to-graduate as
+    // closed. Buys close when sellableTokens reaches zero.
+    if (await curve.graduated() || await curve.readyToGraduate()) {
+      return { token: launch.token, curve: launch.curve, pairToken: launch.pairToken, poolFee: Number(launch.poolFee), tickSpacing: Number(launch.tickSpacing), onCurve: false, graduated: true };
+    }
+  }
+  return { token: launch.token, curve: launch.curve, pairToken: launch.pairToken, poolFee: Number(launch.poolFee), tickSpacing: Number(launch.tickSpacing), onCurve, graduated: !onCurve };
 }
 
 // Curve buy: quote the expected tokens from reserves after fees (base fee +
@@ -137,6 +148,117 @@ async function sellPonsCurve(provider: ethers.JsonRpcProvider, signer: ethers.Wa
   return curve.sell(tokenBalance, minimum, walletAddress);
 }
 
+// ---------------------------------------------------------------------------
+// Pons v2 graduated-pool adapter (Uniswap v4 via Universal Router)
+// ---------------------------------------------------------------------------
+// v4 action IDs per the v4-periphery pinned by Universal Router 2.2.0
+// (Actions.sol): SWAP_EXACT_IN_SINGLE 0x06, SETTLE_ALL 0x0c, TAKE_ALL 0x0f.
+const V4_ACTIONS = { SWAP_EXACT_IN_SINGLE: 0x06, SETTLE_ALL: 0x0c, TAKE_ALL: 0x0f };
+const UNIVERSAL_ROUTER_ABI = [
+  'function execute(bytes commands, bytes[] inputs, uint256 deadline) payable',
+];
+const PERMIT2_ABI = [
+  'function approve(address token, address spender, uint160 amount, uint48 expiration)',
+  'function allowance(address owner, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)',
+];
+// The graduated pool key: currencies sorted with native ETH (zero address)
+// always first, pool fee from the launch record (the hook charges fees, not
+// the pool), tick spacing from the record, shared pons meme hook.
+function ponsPoolKey(launch: PonsLaunch): { currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string } {
+  const token = launch.token.toLowerCase();
+  const pair = launch.pairToken.toLowerCase();
+  const [currency0, currency1] = pair < token ? [launch.pairToken, launch.token] : [launch.token, launch.pairToken];
+  return { currency0, currency1, fee: launch.poolFee, tickSpacing: launch.tickSpacing, hooks: PONS_MEME_HOOK };
+}
+
+// Quote a v4 swap by simulating the exact Universal Router calldata we will
+// send, via eth_call, with binary search on amountOutMinimum: the router
+// reverts when the pool's actual output is below the minimum, so the highest
+// passing minimum converges to the true achievable output. This needs no
+// quoter contract (the chain's V4Quoter is from an older periphery revision),
+// and doubles as a dress rehearsal — if the simulation passes, the real swap
+// uses byte-identical calldata. Requires the wallet to be funded (buys) or to
+// hold the tokens with a Permit2 allowance set (sells), which is true at
+// trade time.
+function v4RouterCalldata(launch: PonsLaunch, zeroForOne: boolean, amountIn: bigint, minimum: bigint, deadline: bigint): string {
+  const poolKey = ponsPoolKey(launch);
+  // SWAP_EXACT_IN_SINGLE, then SETTLE_ALL on the input currency, then
+  // TAKE_ALL of the output credit to the wallet.
+  const actions = ethers.solidityPacked(['uint8', 'uint8', 'uint8'], [V4_ACTIONS.SWAP_EXACT_IN_SINGLE, V4_ACTIONS.SETTLE_ALL, V4_ACTIONS.TAKE_ALL]);
+  const params = [
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ['tuple(address,address,uint24,int24,address)', 'bool', 'uint128', 'uint128', 'uint256', 'bytes'],
+      [[poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks], zeroForOne, amountIn, minimum, 0, '0x'],
+    ),
+    ethers.AbiCoder.defaultAbiCoder().encode(['address', 'uint256'], [zeroForOne ? poolKey.currency0 : poolKey.currency1, amountIn]),
+    ethers.AbiCoder.defaultAbiCoder().encode(['address', 'uint256'], [zeroForOne ? poolKey.currency1 : poolKey.currency0, minimum]),
+  ];
+  const commands = ethers.solidityPacked(['uint8'], [0x10]); // Commands.V4_SWAP
+  return new ethers.Interface(UNIVERSAL_ROUTER_ABI).encodeFunctionData('execute', [commands, params, deadline]);
+}
+
+async function v4Simulates(provider: ethers.Provider, from: string, calldata: string, value: bigint): Promise<boolean> {
+  try { await provider.call({ to: UNIVERSAL_ROUTER_ROBINHOOD, data: calldata, from, value }); return true; }
+  catch { return false; }
+}
+
+async function quoteV4(provider: ethers.Provider, from: string, launch: PonsLaunch, zeroForOne: boolean, amountIn: bigint): Promise<bigint> {
+  const deadline = BigInt((await provider.getBlock('latest'))!.timestamp + 300);
+  // lo: known-passing minimum (starts at 0 = accept any output), hi: known-failing.
+  let lo = 0n, hi = amountIn;
+  if (!await v4Simulates(provider, from, v4RouterCalldata(launch, zeroForOne, amountIn, lo, deadline), zeroForOne ? amountIn : 0n)) {
+    throw new Error(`V4 swap simulation failed for ${zeroForOne ? 'ETH -> token' : 'token -> ETH'} on the graduated pool of ${launch.token}; the pool may be empty, the wallet may lack funds/allowance, or the routing calldata does not match the chain's Universal Router.`);
+  }
+  for (let i = 0; i < 32 && hi - lo > 1n; i++) {
+    const mid = (lo + hi) / 2n;
+    if (await v4Simulates(provider, from, v4RouterCalldata(launch, zeroForOne, amountIn, mid, deadline), zeroForOne ? amountIn : 0n)) lo = mid; else hi = mid;
+  }
+  if (lo <= 0n) throw new Error(`V4 swap simulated to 0 output for ${amountIn} ${zeroForOne ? 'ETH' : 'tokens'} on the graduated pool; the pool may be empty or the token may have fees on transfer.`);
+  return lo;
+}
+
+// The router pulls ERC20 input through Permit2; make sure the wallet has an
+// allowance for the router before quoting (the simulation pays from the
+// wallet, so it needs the allowance too).
+async function ensureV4Permit2(signer: ethers.Wallet, token: string, amountIn: bigint, deadline: bigint): Promise<void> {
+  const permit2 = new ethers.Contract(PERMIT2_ROBINHOOD, PERMIT2_ABI, signer);
+  const [amount, expiration] = await permit2.allowance(signer.address, token, UNIVERSAL_ROUTER_ROBINHOOD);
+  if (amount < amountIn || expiration < deadline) {
+    const erc20Abi = get_erc20_abi();
+    const tokenContract = new ethers.Contract(token, erc20Abi, signer);
+    await tokenContract.approve(PERMIT2_ROBINHOOD, ethers.MaxUint256);
+    await permit2.approve(token, UNIVERSAL_ROUTER_ROBINHOOD, (1n << 160n) - 1n, 0xffffffffffff);
+  }
+}
+
+// Build and submit a v4 swap through the Universal Router. Native input is
+// attached as value; ERC20 input is pulled from the wallet via Permit2.
+async function swapPonsV4(signer: ethers.Wallet, launch: PonsLaunch, zeroForOne: boolean, amountIn: bigint, expectedOut: bigint): Promise<ethers.TransactionResponse> {
+  const minimum = minOut(expectedOut);
+  const deadline = BigInt((await signer.provider!.getBlock('latest'))!.timestamp + 300);
+  const data = v4RouterCalldata(launch, zeroForOne, amountIn, minimum, deadline);
+  if (zeroForOne) {
+    return signer.sendTransaction({ to: UNIVERSAL_ROUTER_ROBINHOOD, data, value: amountIn });
+  }
+  return signer.sendTransaction({ to: UNIVERSAL_ROUTER_ROBINHOOD, data });
+}
+
+// Post-graduation buy: ETH -> token through the graduated v4 pool.
+async function buyPonsV4(signer: ethers.Wallet, launch: PonsLaunch, walletAddress: string, amountIn: bigint): Promise<ethers.TransactionResponse> {
+  const quoted = await quoteV4(signer.provider!, walletAddress, launch, true, amountIn);
+  console.log(`Pons v4: spend ${ethers.formatEther(amountIn)} ETH, expect ~${ethers.formatEther(quoted)} tokens, min ${ethers.formatEther(minOut(quoted))} (slippage ${ROBINHOOD_SLIPPAGE_BPS / 100}%)`);
+  return swapPonsV4(signer, launch, true, amountIn, quoted);
+}
+
+// Post-graduation sell: token -> ETH through the graduated v4 pool.
+async function sellPonsV4(signer: ethers.Wallet, launch: PonsLaunch, walletAddress: string, tokenBalance: bigint): Promise<ethers.TransactionResponse> {
+  const deadline = BigInt((await signer.provider!.getBlock('latest'))!.timestamp + 300);
+  await ensureV4Permit2(signer, launch.token, tokenBalance, deadline);
+  const quoted = await quoteV4(signer.provider!, walletAddress, launch, false, tokenBalance);
+  console.log(`Pons v4: sell ${ethers.formatEther(tokenBalance)} tokens, expect ~${ethers.formatEther(quoted)} ETH, min ${ethers.formatEther(minOut(quoted))} (slippage ${ROBINHOOD_SLIPPAGE_BPS / 100}%)`);
+  return swapPonsV4(signer, launch, false, tokenBalance, quoted);
+}
+
 const baseWallet = {
   privateKey: BASE_WALLET_PRIVATE_KEY,
   address: BASE_WALLET_ADDRESS,
@@ -154,13 +276,18 @@ export const buyToken = async (tokenAddress: string, wallet: Wallet, chainId: Ch
     let tx;
     if (chainId === ChainId.Robinhood) {
       const amountInWei = ethers.parseEther(wallet.amount.toString());
-      // A live Pons v2 launch trades its bonding curve, not Uniswap.
-      const curveAddress = await ponsCurveFor(provider, tokenAddress);
-      if (curveAddress) {
+      // Pons v2 launch? Curve (pre-graduation) or graduated v4 pool; else Uniswap.
+      const launch = await ponsLaunchFor(provider, tokenAddress);
+      if (launch?.onCurve) {
         console.log("=================================== Buying ===================================")
-        console.log(`Token Address: ${tokenAddress} (Pons v2 curve ${curveAddress})`)
+        console.log(`Token Address: ${tokenAddress} (Pons v2 curve ${launch.curve})`)
         await delay(5000);
-        tx = await buyPonsCurve(provider, signer, curveAddress, wallet.address, amountInWei);
+        tx = await buyPonsCurve(provider, signer, launch.curve, wallet.address, amountInWei);
+      } else if (launch?.graduated) {
+        console.log("=================================== Buying ===================================")
+        console.log(`Token Address: ${tokenAddress} (Pons v2 graduated, Uniswap v4 pool)`)
+        await delay(5000);
+        tx = await buyPonsV4(signer, launch, wallet.address, amountInWei);
       } else {
       // Robinhood Chain has no V2-style router; SwapRouter02 wraps the sent ETH
       // into the chain's WETH when tokenIn is WETH and the call carries value.
@@ -231,12 +358,21 @@ export const sellToken = async (tokenAddress: string, wallet: Wallet, chainId: C
     await delay(5000);
     let tx;
     if (chainId === ChainId.Robinhood) {
-      // A live Pons v2 launch trades its bonding curve, not Uniswap.
-      const curveAddress = await ponsCurveFor(provider, tokenAddress);
-      if (curveAddress) {
-        console.log(`Selling ${tokenAddress} via Pons v2 curve ${curveAddress}`);
+      // Pons v2 launch? Curve (pre-graduation) or graduated v4 pool; else Uniswap.
+      const launch = await ponsLaunchFor(provider, tokenAddress);
+      if (launch?.onCurve) {
+        console.log(`Selling ${tokenAddress} via Pons v2 curve ${launch.curve}`);
         await delay(5000);
-        tx = await sellPonsCurve(provider, signer, curveAddress, tokenAddress, wallet.address, tokenBalance);
+        tx = await sellPonsCurve(provider, signer, launch.curve, tokenAddress, wallet.address, tokenBalance);
+        await tx.wait();
+        console.log(`Sell : ${tx.hash}`);
+        await gather(wallet, provider);
+        return tx.hash;
+      }
+      if (launch?.graduated) {
+        console.log(`Selling ${tokenAddress} via Pons v2 graduated pool (Uniswap v4)`);
+        await delay(5000);
+        tx = await sellPonsV4(signer, launch, wallet.address, tokenBalance);
         await tx.wait();
         console.log(`Sell : ${tx.hash}`);
         await gather(wallet, provider);

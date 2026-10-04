@@ -60,6 +60,18 @@ export const UNISWAP_V3_FACTORY_ROBINHOOD = '0x1f7d7550B1b028f7571E69A784071F020
 // Pons v2 launchpad on Robinhood Chain: pre-graduation tokens trade on a
 // per-launch bonding curve, discovered from the factory by token address.
 export const PONS_V2_FACTORY = '0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e';
+// Shared Pons meme hook that owns the graduated pool's fee logic.
+export const PONS_MEME_HOOK = '0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044';
+// Uniswap v4 stack on Robinhood Chain (chain 4663), per the official
+// deployment list. Graduated Pons pools trade through these. The bot quotes
+// v4 swaps by simulating its Universal Router calldata on-chain (binary search
+// on amountOutMinimum) instead of using the quoter lens, which on this chain
+// is from an older periphery revision.
+export const POOL_MANAGER_V4_ROBINHOOD = '0x8366a39cc670b4001a1121b8f6a443a643e40951';
+export const V4_QUOTER_ROBINHOOD = '0x8dc178efb8111bb0973dd9d722ebeff267c98f94';
+export const UNIVERSAL_ROUTER_ROBINHOOD = '0x8876789976decbfcbbbe364623c63652db8c0904';
+// Canonical Permit2; Universal Router pulls ERC20 input through it.
+export const PERMIT2_ROBINHOOD = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
 export const CONFIRM_ENDPOINT = testVersion ? ETH_SEPOLIA_RPC_ENDPOINT : MEV_BLOCK_RPC_ENDPOINT;
 export const ETH_ENDPOINT = testVersion ? ETH_SEPOLIA_RPC_ENDPOINT : ETH_RPC_ENDPOINT;
