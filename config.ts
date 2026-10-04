@@ -17,4 +17,4 @@ export const fee = 0.001; //Must be greater than 0.001
 export const subWalletNum = 2;
 
 //ChainId : Sepolia, BSC, Ethereum, Robinhood (4663 - needs ROBINHOOD_RPC_ENDPOINT in .env)
-export const CHAINID:ChainId = ChainId.BSC;
+export const CHAINID:ChainId = ChainId.Robinhood;
