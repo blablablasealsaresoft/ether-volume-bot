@@ -95,20 +95,20 @@ export const getTokenBalance = async (tokenAddress: string, walletAddress: strin
 export const sendEther = async (fromPrvateKey: string, to: string, amount: string, provider: Provider): Promise<boolean> => {
   const wallet = new Wallet(fromPrvateKey, provider);
   console.log({to, amount})
-  const feeData = await provider.getFeeData();
+  // Robinhood Chain (Arbitrum Orbit): build EIP-1559 fees explicitly from the
+  // live base fee. getFeeData here lags the base fee and produces caps barely
+  // above it, which the chain rejects ("max fee per gas less than block base
+  // fee"). A 6x cap + 0.1 gwei headroom is safe: Orbit chains ignore priority
+  // tips, so only the base fee is ever paid.
+  const block = await provider.getBlock('latest');
+  const base = block?.baseFeePerGas ?? 0n;
   const tx: ethers.TransactionRequest = {
     to,
     value: ethers.parseEther(amount), // Convert amount to wei
-    gasLimit: 21_000, // Standard gas limit for ETH transfers
-    // Handle EIP-1559 if the network supports it
-    ...(feeData.maxFeePerGas && feeData.maxPriorityFeePerGas
-      ? {
-          maxFeePerGas: feeData.maxFeePerGas,
-          maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-        }
-      : {
-          gasPrice: feeData.gasPrice, // Fallback for legacy chains
-        }),
+    gasLimit: 100_000, // Robinhood Chain rejects the 21k minimum as "intrinsic gas too low"
+    type: 2,
+    maxFeePerGas: base * 6n + ethers.parseUnits('0.1', 'gwei'),
+    maxPriorityFeePerGas: 0n,
   };
 
   
@@ -136,7 +136,7 @@ export const gather = async (wallet: any, provider: Provider) => {
 
   // Fetch gas fee data
   const feeData = await provider.getFeeData();
-  const gasLimit = 21_000n; // Standard gas limit for ETH transfer
+  const gasLimit = 100_000n; // Robinhood Chain rejects 21k transfers as "intrinsic gas too low"
 
   // Determine gas fee: Use EIP-1559 fees if available, otherwise fallback to gasPrice
   const gasFee = feeData.maxFeePerGas && feeData.maxPriorityFeePerGas

@@ -144,7 +144,10 @@ async function sellPonsCurve(provider: ethers.JsonRpcProvider, signer: ethers.Wa
   console.log(`Pons curve: sell ${ethers.formatEther(tokenBalance)} tokens, expect ~${ethers.formatEther(expected)} ETH, min ${ethers.formatEther(minimum)} (slippage ${ROBINHOOD_SLIPPAGE_BPS / 100}%)`);
   const erc20Abi = get_erc20_abi();
   const token = new ethers.Contract(tokenAddress, erc20Abi, signer);
-  await token.approve(curveAddress, tokenBalance);
+  // The sell's estimateGas reads the token's allowance, so the approval must
+  // be mined first — awaiting the hash alone races the simulation.
+  const approvalTx = await token.approve(curveAddress, tokenBalance);
+  await approvalTx.wait();
   return curve.sell(tokenBalance, minimum, walletAddress);
 }
 
