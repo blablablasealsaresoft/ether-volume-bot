@@ -57,6 +57,9 @@ export const ROBINHOOD_SLIPPAGE_BPS = Number(process.env['ROBINHOOD_SLIPPAGE_BPS
 // deployment list; QuoterV2 is state-mutating but safe to read via eth_call.
 export const UNISWAP_V3_QUOTER_ROBINHOOD = '0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7';
 export const UNISWAP_V3_FACTORY_ROBINHOOD = '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA';
+// Pons v2 launchpad on Robinhood Chain: pre-graduation tokens trade on a
+// per-launch bonding curve, discovered from the factory by token address.
+export const PONS_V2_FACTORY = '0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e';
 
 export const CONFIRM_ENDPOINT = testVersion ? ETH_SEPOLIA_RPC_ENDPOINT : MEV_BLOCK_RPC_ENDPOINT;
 export const ETH_ENDPOINT = testVersion ? ETH_SEPOLIA_RPC_ENDPOINT : ETH_RPC_ENDPOINT;
