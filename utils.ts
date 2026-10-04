@@ -134,14 +134,14 @@ export const gather = async (wallet: any, provider: Provider) => {
     return;
   }
 
-  // Fetch gas fee data
-  const feeData = await provider.getFeeData();
-  const gasLimit = 100_000n; // Robinhood Chain rejects 21k transfers as "intrinsic gas too low"
-
-  // Determine gas fee: Use EIP-1559 fees if available, otherwise fallback to gasPrice
-  const gasFee = feeData.maxFeePerGas && feeData.maxPriorityFeePerGas
-    ? gasLimit * feeData.maxFeePerGas // EIP-1559 calculation
-    : gasLimit * (feeData.gasPrice ?? 0n); // Legacy transaction fallback
+  // Fetch the live base fee and deduct the worst-case gas cost using the same
+// cap sendEther signs with (base*6 + 0.1 gwei), so the swept amount always
+// leaves enough for the transfer's own gas.
+const block = await provider.getBlock('latest');
+const base = block?.baseFeePerGas ?? 0n;
+const gasLimit = 100_000n; // Robinhood Chain rejects 21k transfers as "intrinsic gas too low"
+const maxFeePerGas = base * 6n + ethers.parseUnits('0.1', 'gwei');
+const gasFee = gasLimit * maxFeePerGas;
 
   // Ensure there's enough ETH to cover gas fees
   if (balance <= gasFee) {
